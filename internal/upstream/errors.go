@@ -61,19 +61,31 @@ func mapTransportError(spec *ToolSpec, err error, displayURL string) *mcp.CallTo
 }
 
 // mapUpstreamResponse maps a completed HTTP response into a CallToolResult.
-// Error-status responses (4xx/5xx) are NEVER shaped by response.select —
-// debugging a failure needs more information, not less — and are always
-// shown raw (truncated).
+// Redirect (3xx) and error-status (4xx/5xx) responses are NEVER shaped by
+// response.select — debugging a failure needs more information, not less —
+// and are always shown raw (truncated). 3xx is treated as an error because
+// the HTTP client does not follow redirects (see NewClient).
 func mapUpstreamResponse(spec *ToolSpec, resp *http.Response) (*mcp.CallToolResult, error) {
-	body, truncated, totalRead := readCapped(resp.Body, defaultMaxResponseBytes)
+	body, truncated, totalRead, err := readCapped(resp.Body, defaultMaxResponseBytes)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return toolError(spec, "upstream_timeout",
+				fmt.Sprintf("reading the response from upstream %q timed out after %s", spec.Upstream.Name, spec.Upstream.Timeout)), nil
+		}
+		return toolError(spec, "upstream_unreachable",
+			fmt.Sprintf("failed to read the full response from upstream %q", spec.Upstream.Name)), nil
+	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= 300 {
 		snippet := string(body)
 		if truncated {
 			snippet += fmt.Sprintf(" [...truncated: response exceeded %d bytes, showing first %d...]", defaultMaxResponseBytes, len(body))
 		}
-		msg := spec.Upstream.Redactor.Redact(
-			fmt.Sprintf("upstream %q returned HTTP %d: %s", spec.Upstream.Name, resp.StatusCode, snippet))
+		msg := fmt.Sprintf("upstream %q returned HTTP %d: %s", spec.Upstream.Name, resp.StatusCode, snippet)
+		if loc := resp.Header.Get("Location"); loc != "" {
+			msg = fmt.Sprintf("upstream %q returned HTTP %d (Location: %s): %s", spec.Upstream.Name, resp.StatusCode, loc, snippet)
+		}
+		msg = spec.Upstream.Redactor.Redact(msg)
 		eb := errBody{
 			Error:    "upstream_error_status",
 			Message:  msg,
@@ -162,13 +174,21 @@ func isTextContentType(ct string) bool {
 // truncation without buffering an unbounded body). totalRead reports how
 // many bytes were actually read (which, when truncated, only tells you the
 // body was AT LEAST that large, not its true total size).
-func readCapped(r io.Reader, max int) (data []byte, truncated bool, totalRead int) {
+//
+// A non-nil error means the body could not be read in full (connection
+// reset, timeout, etc.). Callers must not treat a partial body as a
+// successful upstream response: unlike the size cap, there is no
+// truncation marker, and the bytes may be an incomplete JSON document.
+func readCapped(r io.Reader, max int) (data []byte, truncated bool, totalRead int, err error) {
 	limited := io.LimitReader(r, int64(max)+1)
-	data, _ = io.ReadAll(limited)
+	data, err = io.ReadAll(limited)
 	totalRead = len(data)
+	if err != nil {
+		return data, false, totalRead, err
+	}
 	if len(data) > max {
 		truncated = true
 		data = data[:max]
 	}
-	return data, truncated, totalRead
+	return data, truncated, totalRead, nil
 }

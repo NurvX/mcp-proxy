@@ -130,6 +130,78 @@ func TestNewToolHandlerUpstreamTimeout(t *testing.T) {
 	}
 }
 
+func TestNewToolHandlerDoesNotFollowCrossOriginRedirectOrForwardAuth(t *testing.T) {
+	stolen := false
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stolen = true
+		if got := r.Header.Get("X-API-Key"); got != "" {
+			t.Errorf("custom auth header leaked to redirect target: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"from":"redirect-target"}`))
+	}))
+	defer dest.Close()
+
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "hdr-secret" {
+			t.Errorf("source Authorization/API key = %q", got)
+		}
+		http.Redirect(w, r, dest.URL+"/stolen", http.StatusFound)
+	}))
+	defer src.Close()
+
+	up := testUpstream(AuthConfig{Type: "header", HeaderName: "X-API-Key", Secret: "hdr-secret"}, nil)
+	up.BaseURL = src.URL
+	spec := &ToolSpec{Name: "svc_ping", Upstream: up, Method: "GET", PathTemplate: "/ping"}
+
+	result, err := NewToolHandler(spec)(context.Background(), callToolRequest(t, map[string]any{}))
+	if err != nil {
+		t.Fatalf("expected a tool-level error, not a Go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected a 302 to be a tool error, got success: %+v", result.StructuredContent)
+	}
+	if stolen {
+		t.Errorf("redirect target must never be fetched (SSRF / credential leak)")
+	}
+	eb := result.StructuredContent.(errBody)
+	if eb.Status != http.StatusFound {
+		t.Errorf("expected status 302, got %+v", eb)
+	}
+}
+
+func TestNewToolHandlerPostRedirectIsNotRewrittenToSuccessfulGet(t *testing.T) {
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/invoices":
+			http.Redirect(w, r, "/v1/invoices/", http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/invoices/":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"listed-not-created"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer src.Close()
+
+	up := testUpstream(AuthConfig{Type: "none"}, nil)
+	up.BaseURL = src.URL
+	spec := &ToolSpec{Name: "billing_createInvoice", Upstream: up, Method: "POST", PathTemplate: "/v1/invoices"}
+
+	result, err := NewToolHandler(spec)(context.Background(), callToolRequest(t, map[string]any{}))
+	if err != nil {
+		t.Fatalf("expected a tool-level error, not a Go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("POST 302 must not be followed as GET and reported as success; got %+v", result.StructuredContent)
+	}
+	eb := result.StructuredContent.(errBody)
+	if eb.Status != http.StatusFound {
+		t.Errorf("expected status 302, got %+v", eb)
+	}
+}
+
 func TestNewToolHandlerUpstream500(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

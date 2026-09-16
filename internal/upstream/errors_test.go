@@ -170,6 +170,79 @@ func TestMapTransportErrorNeverLeaksQuerySecret(t *testing.T) {
 	}
 }
 
+func TestMapUpstreamResponse3xxIsErrorAndIncludesLocation(t *testing.T) {
+	spec := testSpec(nil, nil)
+	result, err := mapUpstreamResponse(spec, fakeResponse(302, "", map[string]string{
+		"Location": "https://evil.example.com/steal",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected IsError=true for a 302; following it would leak credentials / hit a different host")
+	}
+	eb := result.StructuredContent.(errBody)
+	if eb.Error != "upstream_error_status" || eb.Status != 302 {
+		t.Fatalf("unexpected errBody: %+v", eb)
+	}
+	if !strings.Contains(eb.Message, "https://evil.example.com/steal") {
+		t.Errorf("expected Location in the error message, got %q", eb.Message)
+	}
+}
+
+func TestMapUpstreamResponse3xxRedactsSecretInLocation(t *testing.T) {
+	spec := testSpec(nil, NewRedactor("q-secret"))
+	result, err := mapUpstreamResponse(spec, fakeResponse(301, "", map[string]string{
+		"Location": "https://api.example.com/x?api_key=q-secret",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	eb := result.StructuredContent.(errBody)
+	if strings.Contains(eb.Message, "q-secret") {
+		t.Errorf("secret leaked through redirect Location: %q", eb.Message)
+	}
+}
+
+type errAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestMapUpstreamResponseIncompleteBodyIsErrorNotSuccess(t *testing.T) {
+	spec := testSpec(nil, nil)
+	partial := `{"id":"inv_1","totals":`
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(&errAfterReader{data: []byte(partial), err: io.ErrUnexpectedEOF}),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+	result, err := mapUpstreamResponse(spec, resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected a truncated-by-network-error body to be a tool error, not a successful partial document; got %+v", result.StructuredContent)
+	}
+	eb := result.StructuredContent.(errBody)
+	if eb.Error != "upstream_unreachable" {
+		t.Errorf("expected upstream_unreachable, got %q", eb.Error)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if strings.Contains(text, partial) {
+		t.Errorf("partial body must not be returned as the tool result: %q", text)
+	}
+}
+
 func TestMapUpstreamResponseTruncatesOversizedBody(t *testing.T) {
 	spec := testSpec(nil, nil)
 	big := strings.Repeat("a", defaultMaxResponseBytes+1000)
